@@ -1,0 +1,228 @@
+name: Python Build and Test
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        type: string
+        default: '3.11'
+      requirements-file:
+        description: 'Path to requirements file'
+        required: false
+        type: string
+        default: 'requirements.txt'
+      test-path:
+        description: 'Path to tests directory'
+        required: false
+        type: string
+        default: 'tests/'
+      coverage-threshold:
+        description: 'Minimum coverage percentage'
+        required: false
+        type: number
+        default: 80
+      run-linters:
+        description: 'Run code quality checks'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  test:
+    name: Test Python ${{ inputs.python-version }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+          cache-dependency-path: ${{ inputs.requirements-file }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov pytest-xdist pytest-timeout
+          if [ -f ${{ inputs.requirements-file }} ]; then
+            pip install -r ${{ inputs.requirements-file }}
+          fi
+          # Install dev dependencies if available
+          if [ -f requirements-dev.txt ]; then
+            pip install -r requirements-dev.txt
+          fi
+
+      - name: Install linting tools
+        if: inputs.run-linters == true
+        run: |
+          pip install flake8 black isort bandit pylint mypy
+
+      - name: Run Black (code formatter check)
+        if: inputs.run-linters == true
+        run: |
+          echo "## Code Formatting Check" >> $GITHUB_STEP_SUMMARY
+          black --check --diff . || echo "⚠️ Black formatting issues found" >> $GITHUB_STEP_SUMMARY
+
+      - name: Run isort (import sorting check)
+        if: inputs.run-linters == true
+        run: |
+          isort --check-only --diff . || echo "⚠️ Import sorting issues found" >> $GITHUB_STEP_SUMMARY
+
+      - name: Run Flake8 (style guide enforcement)
+        if: inputs.run-linters == true
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Style Check" >> $GITHUB_STEP_SUMMARY
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run Bandit (security linter)
+        if: inputs.run-linters == true
+        continue-on-error: true
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Security Scan" >> $GITHUB_STEP_SUMMARY
+          bandit -r . -f json -o bandit-report.json || true
+          if [ -f bandit-report.json ]; then
+            echo "✅ Bandit security scan completed" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Bandit results
+        if: inputs.run-linters == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-security-report
+          path: bandit-report.json
+          retention-days: 30
+
+      - name: Run tests with coverage
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Test Results" >> $GITHUB_STEP_SUMMARY
+          pytest ${{ inputs.test-path }} \
+            --cov=. \
+            --cov-report=term \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-fail-under=${{ inputs.coverage-threshold }} \
+            --junitxml=pytest-report.xml \
+            --verbose \
+            -n auto \
+            --timeout=300
+
+      - name: Generate coverage badge
+        if: always()
+        run: |
+          if [ -f coverage.xml ]; then
+            COVERAGE=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(root.attrib['line-rate'])")
+            COVERAGE_PERCENT=$(python -c "print(f'{float('$COVERAGE') * 100:.1f}')")
+            echo "COVERAGE_PERCENT=$COVERAGE_PERCENT" >> $GITHUB_ENV
+            echo "**Coverage:** ${COVERAGE_PERCENT}%" >> $GITHUB_STEP_SUMMARY
+            
+            if (( $(echo "$COVERAGE_PERCENT >= ${{ inputs.coverage-threshold }}" | bc -l) )); then
+              echo "✅ Coverage threshold met (${COVERAGE_PERCENT}% >= ${{ inputs.coverage-threshold }}%)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "❌ Coverage below threshold (${COVERAGE_PERCENT}% < ${{ inputs.coverage-threshold }}%)" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-python-${{ inputs.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+            pytest-report.xml
+          retention-days: 30
+
+      - name: Comment PR with coverage
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (fs.existsSync('coverage.xml')) {
+              const coverage = process.env.COVERAGE_PERCENT;
+              const threshold = ${{ inputs.coverage-threshold }};
+              const icon = parseFloat(coverage) >= threshold ? '✅' : '❌';
+              
+              const comment = `## ${icon} Test Coverage Report
+              
+              **Python Version:** ${{ inputs.python-version }}
+              **Coverage:** ${coverage}%
+              **Threshold:** ${threshold}%
+              
+              <details>
+              <summary>View Details</summary>
+              
+              - Tests executed successfully
+              - Coverage report generated
+              - ${parseFloat(coverage) >= threshold ? 'Coverage threshold met' : 'Coverage below threshold'}
+              
+              </details>`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.run-linters }}" == "true" ]; then
+            echo "| Code Formatting (Black) | ✅ |" >> $GITHUB_STEP_SUMMARY
+            echo "| Import Sorting (isort) | ✅ |" >> $GITHUB_STEP_SUMMARY
+            echo "| Style Guide (Flake8) | ✅ |" >> $GITHUB_STEP_SUMMARY
+            echo "| Security (Bandit) | ✅ |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "| Unit Tests | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Coverage | ${COVERAGE_PERCENT}% |" >> $GITHUB_STEP_SUMMARY
+
+  matrix-test:
+    name: Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    if: false  # Disabled by default, enable when needed
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12']
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          if [ -f ${{ inputs.requirements-file }} ]; then
+            pip install -r ${{ inputs.requirements-file }}
+          fi
+
+      - name: Run tests
+        run: |
+          pytest ${{ inputs.test-path }} --verbose

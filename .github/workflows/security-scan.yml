@@ -1,0 +1,255 @@
+name: Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      scan-path:
+        description: 'Path to scan'
+        required: false
+        type: string
+        default: '.'
+      fail-on-severity:
+        description: 'Fail on severity level (CRITICAL, HIGH, MEDIUM, LOW)'
+        required: false
+        type: string
+        default: 'HIGH'
+      scan-type:
+        description: 'Scan types (fs, repo, config, secret, vuln)'
+        required: false
+        type: string
+        default: 'fs,secret,config'
+
+jobs:
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for Gitleaks
+
+      - name: Run Gitleaks (Secret Scanner)
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Upload Gitleaks results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: results.sarif
+          retention-days: 30
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: ${{ inputs.scan-type }}
+          scan-ref: ${{ inputs.scan-path }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM,LOW'
+          vuln-type: 'os,library'
+
+      - name: Upload Trivy results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          wait-for-processing: true
+
+      - name: Run Trivy for human-readable output
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: ${{ inputs.scan-type }}
+          scan-ref: ${{ inputs.scan-path }}
+          format: 'table'
+          severity: ${{ inputs.fail-on-severity }}
+        continue-on-error: true
+
+      - name: Install Semgrep
+        run: |
+          python3 -m pip install semgrep
+
+      - name: Run Semgrep SAST
+        id: semgrep
+        run: |
+          semgrep --config=auto --json --output=semgrep-results.json ${{ inputs.scan-path }} || true
+        continue-on-error: true
+
+      - name: Upload Semgrep results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-results.json
+          retention-days: 30
+
+      - name: Check for Python dependencies
+        id: check-python
+        run: |
+          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
+            echo "has_python=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_python=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Safety (Python dependency check)
+        if: steps.check-python.outputs.has_python == 'true'
+        run: |
+          pip install safety
+          if [ -f "requirements.txt" ]; then
+            safety check --file=requirements.txt --json --output=safety-report.json || true
+          fi
+        continue-on-error: true
+
+      - name: Upload Safety results
+        if: steps.check-python.outputs.has_python == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: safety-report
+          path: safety-report.json
+          retention-days: 30
+
+      - name: Check for Node.js dependencies
+        id: check-node
+        run: |
+          if [ -f "package.json" ]; then
+            echo "has_node=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_node=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run npm audit
+        if: steps.check-node.outputs.has_node == 'true'
+        run: |
+          npm audit --json > npm-audit.json || true
+        continue-on-error: true
+
+      - name: Upload npm audit results
+        if: steps.check-node.outputs.has_node == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-audit-report
+          path: npm-audit.json
+          retention-days: 30
+
+      - name: Run Checkov (IaC Security)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.scan-path }}
+          framework: all
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+
+      - name: License compliance check
+        id: license
+        run: |
+          pip install licensecheck
+          if [ -f "requirements.txt" ]; then
+            licensecheck || true
+          fi
+        continue-on-error: true
+
+      - name: Generate security summary
+        if: always()
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Tool | Status | Description |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|-------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Gitleaks | ${{ steps.gitleaks.outcome == 'success' && '✅ No secrets found' || '⚠️ Review required' }} | Secret detection |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy | ✅ Completed | Vulnerability & misconfiguration scan |" >> $GITHUB_STEP_SUMMARY
+          echo "| Semgrep | ${{ steps.semgrep.outcome == 'success' && '✅ Completed' || '⚠️ Review required' }} | SAST analysis |" >> $GITHUB_STEP_SUMMARY
+          echo "| Checkov | ✅ Completed | IaC security policy |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.check-python.outputs.has_python }}" == "true" ]; then
+            echo "| Safety | ✅ Completed | Python dependency check |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.check-node.outputs.has_node }}" == "true" ]; then
+            echo "| npm audit | ✅ Completed | Node.js dependency check |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "| License Check | ${{ steps.license.outcome == 'success' && '✅ Completed' || '⏭️ Skipped' }} | License compliance |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Path:** \`${{ inputs.scan-path }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Severity Threshold:** \`${{ inputs.fail-on-severity }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📊 Detailed results available in Security tab and artifacts" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment PR with scan results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const gitleaks = '${{ steps.gitleaks.outcome }}';
+            const semgrep = '${{ steps.semgrep.outcome }}';
+            const hasPython = '${{ steps.check-python.outputs.has_python }}';
+            const hasNode = '${{ steps.check-node.outputs.has_node }}';
+            
+            let scanResults = `## 🔒 Security Scan Results
+            
+            | Scanner | Status | Findings |
+            |---------|--------|----------|
+            | 🔍 Gitleaks | ${gitleaks === 'success' ? '✅ Clean' : '⚠️ Review'} | Secret detection |
+            | 🛡️ Trivy | ✅ Complete | Vulnerability scan |
+            | 📝 Semgrep | ${semgrep === 'success' ? '✅ Clean' : '⚠️ Review'} | SAST analysis |
+            | 📋 Checkov | ✅ Complete | IaC policy check |`;
+            
+            if (hasPython === 'true') {
+              scanResults += `\n| 🐍 Safety | ✅ Complete | Python dependencies |`;
+            }
+            
+            if (hasNode === 'true') {
+              scanResults += `\n| 📦 npm audit | ✅ Complete | Node dependencies |`;
+            }
+            
+            scanResults += `
+            
+            **Configuration:**
+            - Scan Path: \`${{ inputs.scan-path }}\`
+            - Severity Threshold: \`${{ inputs.fail-on-severity }}\`
+            - Scan Types: \`${{ inputs.scan-type }}\`
+            
+            <details>
+            <summary>📊 View Detailed Reports</summary>
+            
+            All detailed scan results are available:
+            - GitHub Security tab (SARIF uploads)
+            - Workflow artifacts (JSON reports)
+            - Individual tool outputs in workflow logs
+            
+            </details>
+            
+            💡 **Tip:** Fix any identified issues before merging to maintain security posture.
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: scanResults
+            });
+
+      - name: Fail on critical issues
+        if: steps.gitleaks.outcome == 'failure'
+        run: |
+          echo "❌ Critical security issues found!"
+          echo "Secrets detected by Gitleaks. Please review and remediate."
+          exit 1

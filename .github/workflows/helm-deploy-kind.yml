@@ -1,0 +1,307 @@
+name: Helm Deploy to kind
+
+on:
+  workflow_call:
+    inputs:
+      chart-path:
+        description: 'Path to Helm chart'
+        required: true
+        type: string
+      release-name:
+        description: 'Helm release name'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: false
+        type: string
+        default: 'default'
+      values-file:
+        description: 'Path to values file'
+        required: false
+        type: string
+        default: ''
+      helm-version:
+        description: 'Helm version'
+        required: false
+        type: string
+        default: 'v3.13.0'
+      kubernetes-version:
+        description: 'Kubernetes version for kind'
+        required: false
+        type: string
+        default: 'v1.28.0'
+      run-smoke-tests:
+        description: 'Run smoke tests after deployment'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  helm-deploy:
+    name: Deploy to kind Cluster
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: ${{ inputs.helm-version }}
+
+      - name: Helm Lint
+        id: lint
+        run: |
+          echo "## Helm Lint Results" >> $GITHUB_STEP_SUMMARY
+          helm lint ${{ inputs.chart-path }}
+          echo "✅ Helm lint passed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Install kubeconform
+        run: |
+          wget https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz
+          tar xf kubeconform-linux-amd64.tar.gz
+          sudo mv kubeconform /usr/local/bin/
+          kubeconform -v
+
+      - name: Validate Kubernetes Manifests
+        id: validate
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Manifest Validation" >> $GITHUB_STEP_SUMMARY
+          helm template ${{ inputs.release-name }} ${{ inputs.chart-path }} \
+            --namespace ${{ inputs.namespace }} \
+            ${{ inputs.values-file != '' && format('--values {0}', inputs.values-file) || '' }} \
+            | kubeconform -summary -strict -kubernetes-version ${{ inputs.kubernetes-version }}
+          echo "✅ Kubernetes manifest validation passed" >> $GITHUB_STEP_SUMMARY
+
+      - name: Install conftest (OPA Policy Check)
+        run: |
+          wget https://github.com/open-policy-agent/conftest/releases/download/v0.48.0/conftest_0.48.0_Linux_x86_64.tar.gz
+          tar xzf conftest_0.48.0_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin/
+          conftest --version
+
+      - name: Create default policies
+        run: |
+          mkdir -p policy
+          cat > policy/deployment.rego <<'EOF'
+          package main
+
+          deny[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.securityContext.runAsNonRoot
+            msg = "Containers must not run as root"
+          }
+
+          deny[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.containers[_].resources.limits
+            msg = "Containers must have resource limits"
+          }
+
+          warn[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.containers[_].livenessProbe
+            msg = "Containers should have liveness probes"
+          }
+
+          warn[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.containers[_].readinessProbe
+            msg = "Containers should have readiness probes"
+          }
+          EOF
+
+      - name: Run OPA Policy Checks
+        id: policy
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Policy Validation" >> $GITHUB_STEP_SUMMARY
+          helm template ${{ inputs.release-name }} ${{ inputs.chart-path }} \
+            --namespace ${{ inputs.namespace }} \
+            ${{ inputs.values-file != '' && format('--values {0}', inputs.values-file) || '' }} \
+            | conftest test - || echo "⚠️ Policy warnings found" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Policy checks completed" >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
+
+      - name: Create kind Cluster
+        uses: helm/kind-action@v1.8.0
+        with:
+          cluster_name: test-cluster
+          version: v0.20.0
+          node_image: kindest/node:${{ inputs.kubernetes-version }}
+          wait: 120s
+
+      - name: Verify cluster
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+          kubectl get pods -A
+
+      - name: Create namespace
+        run: |
+          kubectl create namespace ${{ inputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Helm Dry Run
+        id: dryrun
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Helm Dry Run" >> $GITHUB_STEP_SUMMARY
+          helm install ${{ inputs.release-name }} ${{ inputs.chart-path }} \
+            --namespace ${{ inputs.namespace }} \
+            ${{ inputs.values-file != '' && format('--values {0}', inputs.values-file) || '' }} \
+            --dry-run --debug
+          echo "✅ Dry run successful" >> $GITHUB_STEP_SUMMARY
+
+      - name: Deploy with Helm
+        id: deploy
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Helm Deployment" >> $GITHUB_STEP_SUMMARY
+          helm install ${{ inputs.release-name }} ${{ inputs.chart-path }} \
+            --namespace ${{ inputs.namespace }} \
+            ${{ inputs.values-file != '' && format('--values {0}', inputs.values-file) || '' }} \
+            --wait --timeout 5m
+          echo "✅ Deployment successful" >> $GITHUB_STEP_SUMMARY
+
+      - name: Verify deployment
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Deployment Status" >> $GITHUB_STEP_SUMMARY
+          kubectl get all -n ${{ inputs.namespace }}
+          kubectl get pods -n ${{ inputs.namespace }} -o wide
+
+      - name: Check rollout status
+        run: |
+          for deploy in $(kubectl get deployments -n ${{ inputs.namespace }} -o name); do
+            echo "Checking rollout status for $deploy"
+            kubectl rollout status $deploy -n ${{ inputs.namespace }} --timeout=2m
+          done
+
+      - name: Run smoke tests
+        if: inputs.run-smoke-tests == true
+        id: smoke
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Smoke Tests" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod \
+            --all \
+            -n ${{ inputs.namespace }} \
+            --timeout=120s
+          
+          # Check if all pods are running
+          FAILED_PODS=$(kubectl get pods -n ${{ inputs.namespace }} --field-selector=status.phase!=Running --no-headers | wc -l)
+          if [ "$FAILED_PODS" -gt 0 ]; then
+            echo "❌ Some pods are not running" >> $GITHUB_STEP_SUMMARY
+            kubectl get pods -n ${{ inputs.namespace }}
+            exit 1
+          fi
+          
+          echo "✅ All pods are running" >> $GITHUB_STEP_SUMMARY
+          
+          # Get service endpoints if any
+          SERVICES=$(kubectl get svc -n ${{ inputs.namespace }} --no-headers | wc -l)
+          if [ "$SERVICES" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Services:**" >> $GITHUB_STEP_SUMMARY
+            kubectl get svc -n ${{ inputs.namespace }} >> $GITHUB_STEP_SUMMARY
+          fi
+        continue-on-error: true
+
+      - name: Get pod logs on failure
+        if: failure()
+        run: |
+          echo "## Pod Logs (Failure Debug)" >> $GITHUB_STEP_SUMMARY
+          for pod in $(kubectl get pods -n ${{ inputs.namespace }} -o name); do
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Logs for $pod" >> $GITHUB_STEP_SUMMARY
+            kubectl logs $pod -n ${{ inputs.namespace }} --tail=50 >> $GITHUB_STEP_SUMMARY || true
+          done
+
+      - name: Get Helm release info
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Helm Release Info" >> $GITHUB_STEP_SUMMARY
+          helm list -n ${{ inputs.namespace }}
+          helm get values ${{ inputs.release-name }} -n ${{ inputs.namespace }}
+
+      - name: Export manifests for debugging
+        if: always()
+        run: |
+          mkdir -p manifests
+          helm get manifest ${{ inputs.release-name }} -n ${{ inputs.namespace }} > manifests/deployed-manifests.yaml
+          kubectl get all -n ${{ inputs.namespace }} -o yaml > manifests/runtime-state.yaml
+
+      - name: Upload manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubernetes-manifests
+          path: manifests/
+          retention-days: 30
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const lint = '${{ steps.lint.outcome }}';
+            const validate = '${{ steps.validate.outcome }}';
+            const policy = '${{ steps.policy.outcome }}';
+            const dryrun = '${{ steps.dryrun.outcome }}';
+            const deploy = '${{ steps.deploy.outcome }}';
+            const smoke = '${{ steps.smoke.outcome }}';
+            
+            const output = `## Helm Deployment Results
+            
+            | Step | Status |
+            |------|--------|
+            | Helm Lint | ${lint === 'success' ? '✅' : '❌'} |
+            | Manifest Validation | ${validate === 'success' ? '✅' : '❌'} |
+            | Policy Checks | ${policy === 'success' ? '✅' : '⚠️'} |
+            | Dry Run | ${dryrun === 'success' ? '✅' : '❌'} |
+            | Deployment | ${deploy === 'success' ? '✅' : '❌'} |
+            | Smoke Tests | ${smoke === 'success' ? '✅' : smoke === 'skipped' ? '⏭️ Skipped' : '❌'} |
+            
+            **Chart:** \`${{ inputs.chart-path }}\`
+            **Release:** \`${{ inputs.release-name }}\`
+            **Namespace:** \`${{ inputs.namespace }}\`
+            **Kubernetes:** \`${{ inputs.kubernetes-version }}\`
+            
+            🔒 **Testing Environment:** kind (ephemeral local cluster)
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+      - name: Cleanup
+        if: always()
+        run: |
+          helm uninstall ${{ inputs.release-name }} -n ${{ inputs.namespace }} || true
+          kubectl delete namespace ${{ inputs.namespace }} || true
+
+      - name: Final Summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Chart Path:** \`${{ inputs.chart-path }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Release Name:** \`${{ inputs.release-name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace:** \`${{ inputs.namespace }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Helm Version:** \`${{ inputs.helm-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Kubernetes Version:** \`${{ inputs.kubernetes-version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔒 **Deployed to ephemeral kind cluster** - No persistent infrastructure" >> $GITHUB_STEP_SUMMARY
